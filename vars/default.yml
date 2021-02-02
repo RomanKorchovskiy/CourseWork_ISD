@@ -1,0 +1,13 @@
+---
+#MySQL Settings
+mysql_root_password: "password123"
+mysql_db: "wordpress"
+mysql_user: "ubuntu"
+mysql_password: "password123"
+mysql_db_lemp: "testdb"
+
+#HTTP Settings
+http_host: "html"
+http_conf: "html.conf"
+http_port: "80"
+http_port_wordpress: "8080"

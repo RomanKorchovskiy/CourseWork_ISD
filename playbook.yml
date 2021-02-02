@@ -1,0 +1,264 @@
+---
+- hosts: all
+  become: true
+  vars_files:
+    - vars/default.yml
+
+  tasks:
+    - name: Install Prerequisites
+      apt: name='aptitude' update_cache=yes state=latest force_apt_get=yes
+    - name: Install LEMP Packages
+      apt: 
+        name: "{{ item }}"
+        update_cache: yes 
+        state: latest
+      with_items: 
+        - mysql-server
+        - python3-pip
+        - libmysqlclient-dev
+        - python3-dev
+        - python3-mysqldb
+        - python3-pymysql
+        - php
+        - php-common
+        - php-cli
+        - php-dev
+        - php-fpm
+        - php-mysql
+        - php-mbstring 
+        - php-gd
+    - name: "UFW - Allow HTTP on port {{ http_port }}"
+      ufw:
+        rule: allow
+        port: "{{ http_port }}"
+        proto: tcp
+
+    - name: "UFW - Allow HTTP on port {{ http_port_wordpress }}"
+      ufw:
+        rule: allow
+        port: "{{ http_port_wordpress }}"
+        proto: tcp
+  
+# Nginx Configuration
+    - name: apt-get update and install nginx
+      apt: name=nginx state=latest update_cache=true
+      register: nginxinstalled
+      notify:
+          - Restart Nginx
+    - name: Sets Nginx conf file
+      template:
+        src: "files/nginx.conf.j2"
+        dest: "/etc/nginx/nginx.conf"
+        owner: root 
+        group: root 
+        mode: 0600  
+    - name: Set virtualhost file
+      template:
+        src: "files/virtualhost.conf.j2"
+        dest: "/etc/nginx/sites-available/nginx.conf"
+        owner: root 
+        group: root 
+        mode: 0600
+    - name: Enables new site
+      file:
+        src: "/etc/nginx/sites-available/nginx.conf"
+        dest: "/etc/nginx/sites-enabled/nginx.conf"
+        state: link
+      notify: 
+        - Reload Nginx
+    - name: Perform action of the desired files
+      file:
+        src: "{{ item.src | default(omit) }}"
+        dest: "{{ item.dest }}"
+        state: "{{ item.state }}"
+      with_items:
+        - { dest: '/etc/nginx/sites-enabled/default', state: 'absent' }
+        - { dest: '/var/www/html/index.nginx-debian.html', state: 'absent' }
+        - { src: '/etc/nginx/sites-available/nginx.conf', dest: '/etc/nginx/sites-enabled/nginx.conf', state: 'link' }
+      notify:
+        - Stop Apache2
+        - Restart PHP7-FPM 
+        - Restart Nginx
+
+# MySQL Configuration
+    - name: Start MySQL
+      service: name=mysql state=started
+      become: true
+    - name: Ensure mysql is running and starts on boot
+      service:
+        name: mysql
+        state: started
+        enabled: yes
+      become: yes
+    - name: Ensure mysql root password is updated for all root accounts
+      mysql_user:
+        name: root
+        host: "{{ item }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        password: "{{ mysql_root_password }}"
+        priv: '*.*:ALL,GRANT'
+        check_implicit_admin: true
+      with_items:
+        - 127.0.0.1
+        - ::1
+        - localhost
+      notify: Restart MySQL
+    - name: Copy the templates to their respestive destination
+      template:
+        src: "files/root.cnf.j2"
+        dest: "~/.my.cnf"
+        owner: root 
+        group: root 
+        mode: 0600
+    - name: Ensure Anonymous user(s) are not in the database
+      mysql_user:
+        name: ''
+        host: 'localhost'
+        state: absent
+    - name: Remove the test database
+      mysql_db:
+        name: test
+        state: absent
+      notify:
+        - Restart MySQL
+    - name: Creates database for WordPress
+      mysql_db:
+        name: "{{ mysql_db }}"
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      tags: [ mysql ]
+    - name: Create MySQL user for WordPress
+      mysql_user:
+        name: "{{ mysql_user }}"
+        password: "{{ mysql_password }}"
+        priv: "{{ mysql_db }}.*:ALL"
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      tags: [ mysql ]
+    - name: Copy the database file
+      template:
+        src: "files/backup_isd.sql.j2"
+        dest: "/tmp/backup_isd.sql"
+    - name: Remove the existing database
+      mysql_db:
+        name: "{{ mysql_db_lemp }}"
+        state: absent
+    - name: Restore database
+      mysql_db:
+        name: "{{ mysql_db_lemp }}"
+        state: import
+        target: /tmp/backup_isd.sql
+
+# Sets Up PHP Info Page
+    - name: Sets Up PHP Info Page
+      template:
+        src: "files/info.php.j2"
+        dest: "/var/www/html/info.php"
+    - name: Copy the templates to their respestive destination
+      template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+      with_items:
+        - { src: 'files/www.conf.j2', dest: '/etc/php/7.4/fpm/pool.d/www.conf' }
+        - { src: 'files/php.ini.j2', dest: '/etc/php/7.4/fpm/php.ini' }
+      notify:
+        - Restart PHP7-FPM
+    - name: Sets Up HTML Page
+      template:
+        src: "files/index.html.j2"
+        dest: "/var/www/html/index.html"
+
+  # WordPress Configuration
+    - name: Creates directory
+      file:
+        path: /var/www/wordpress
+        state: directory
+
+    - name: Download and unpack latest WordPress
+      unarchive:
+        src: https://wordpress.org/latest.tar.gz
+        dest: "/var/www/wordpress"
+        remote_src: yes
+        creates: "/var/www/wordpress/wordpress"
+      tags: [ wordpress ]
+
+    - name: Set ownership
+      file:
+        path: "/var/www/wordpress"
+        state: directory
+        recurse: yes
+        owner: www-data
+        group: www-data
+      tags: [ wordpress ]
+
+    - name: Set permissions for directories
+      shell: "/usr/bin/find /var/www/wordpress/wordpress -type d -exec chmod 750 {} \\;"
+      tags: [ wordpress ]
+
+    - name: Set permissions for files
+      shell: "/usr/bin/find /var/www/wordpress/wordpress -type f -exec chmod 640 {} \\;"
+      tags: [ wordpress ]
+
+    - name: Set up wp-config
+      template:
+        src: "files/wp-config.php.j2"
+        dest: "/var/www/wordpress/wordpress/wp-config.php"
+      tags: [ wordpress ]
+      notify:
+        - Stop Apache2
+        - Restart PHP7-FPM 
+        - Restart Nginx
+
+   # phpMyAdmin Configuration    
+    - name: debconf for phpmyadmin
+      debconf:
+        name: phpmyadmin
+        question: "{{ item.question }}"
+        value: "{{ item.value }}"
+        vtype: "{{ item.vtype }}"
+      with_items:
+        - { question: 'phpmyadmin/dbconfig-install', value: 'true', vtype: 'boolean' }
+        - { question: 'phpmyadmin/app-password-confirm', value: '{{ mysql_password }}', vtype: 'password' }
+        - { question: 'phpmyadmin/mysql/admin-pass', value: '{{ mysql_password }}', vtype: 'password' }
+        - { question: 'phpmyadmin/mysql/app-pass', value: '{{ mysql_password }}', vtype: 'password' }
+        - { question: 'phpmyadmin/reconfigure-webserver', value: '', vtype: 'multiselect' }
+
+    - name: Install the phpmyadmin
+      apt:
+        name: phpmyadmin
+        state: present
+
+    - name: Configure site for phpmyadmin
+      file:
+        path: "/var/www/html/phpmyadmin"
+        src: "/usr/share/phpmyadmin"
+        state: link
+  handlers:
+    - name: Stop Apache2
+      service:
+        name: apache2
+        state: stopped
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+    - name: Restart MySQL
+      service:
+        name: mysql
+        state: restarted
+    - name: Restart PHP7-FPM
+      service:
+        name: php7.4-fpm
+        state: restarted
+    - name: Restart MySQL
+      service:
+        name: mysql
+        state: restarted
